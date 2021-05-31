@@ -39,6 +39,7 @@ const (
 type Logger struct {
 	level        Level
 	destinations map[Destination]struct{}
+	callback     func(string)
 
 	mutex        sync.Mutex
 	file         *os.File
@@ -49,10 +50,11 @@ type Logger struct {
 }
 
 // New allocates a log handler.
-func New(level Level, destinations map[Destination]struct{}, filePath string) (*Logger, error) {
+func New(level Level, destinations map[Destination]struct{}, filePath string, callback func(log string)) (*Logger, error) {
 	lh := &Logger{
 		level:        level,
 		destinations: destinations,
+		callback:     callback,
 	}
 
 	if _, ok := destinations[DestinationFile]; ok {
@@ -177,7 +179,12 @@ func (lh *Logger) Log(level Level, format string, args ...interface{}) {
 		writeTime(&lh.stdoutBuffer, true)
 		writeLevel(&lh.stdoutBuffer, level, true)
 		writeContent(&lh.stdoutBuffer, format, args)
-		print(lh.stdoutBuffer.String())
+
+		if lh.callback != nil {
+			lh.callback(lh.stdoutBuffer.String())
+		} else {
+			print(lh.stdoutBuffer.String())
+		}
 	}
 
 	if _, ok := lh.destinations[DestinationFile]; ok {

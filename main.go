@@ -1,489 +1,213 @@
 package main
 
 import (
-	"context"
+	"bufio"
+	"encoding/json"
 	"fmt"
-	"os"
-	"reflect"
-	"sync/atomic"
+	"io"
+	"log"
+	"net"
+	"strings"
+	"time"
 
-	"github.com/aler9/gortsplib"
-	"gopkg.in/alecthomas/kingpin.v2"
-
-	"github.com/aler9/rtsp-simple-server/internal/conf"
-	"github.com/aler9/rtsp-simple-server/internal/confwatcher"
-	"github.com/aler9/rtsp-simple-server/internal/hlsserver"
-	"github.com/aler9/rtsp-simple-server/internal/logger"
-	"github.com/aler9/rtsp-simple-server/internal/metrics"
-	"github.com/aler9/rtsp-simple-server/internal/pathman"
-	"github.com/aler9/rtsp-simple-server/internal/pprof"
-	"github.com/aler9/rtsp-simple-server/internal/rlimit"
-	"github.com/aler9/rtsp-simple-server/internal/rtmpserver"
-	"github.com/aler9/rtsp-simple-server/internal/rtspserver"
-	"github.com/aler9/rtsp-simple-server/internal/stats"
+	"github.com/AsynkronIT/protoactor-go/actor"
 )
 
-var version = "v0.0.0"
+type state string
 
-type program struct {
-	ctx             context.Context
-	ctxCancel       func()
-	confPath        string
-	conf            *conf.Conf
-	confFound       bool
-	stats           *stats.Stats
-	logger          *logger.Logger
-	metrics         *metrics.Metrics
-	pprof           *pprof.PPROF
-	pathMan         *pathman.PathManager
-	serverRTSPPlain *rtspserver.Server
-	serverRTSPTLS   *rtspserver.Server
-	serverRTMP      *rtmpserver.Server
-	serverHLS       *hlsserver.Server
-	confWatcher     *confwatcher.ConfWatcher
+const (
+	IDLE         state = "IDLE"
+	STARTING     state = "STARTING"
+	STARTED      state = "STARTED"
+	PAUSED       state = "PAUSED"
+	STOPPING     state = "STOPPING"
+	RECONNECTING state = "RECONNECTING"
+)
 
-	// out
-	done chan struct{}
+type caster struct {
+	cli     net.Conn
+	pusher  *actor.PID
+	closeCh chan struct{}
+	rtmp    *program
+
+	tvip string
+	res  string
+	self *actor.PID
+	s    state
 }
 
-func newProgram(args []string) (*program, bool) {
-	k := kingpin.New("rtsp-simple-server",
-		"rtsp-simple-server "+version+"\n\nRTSP server.")
-
-	argVersion := k.Flag("version", "print version").Bool()
-	argConfPath := k.Arg("confpath", "path to a config file. The default is rtsp-simple-server.yml.").Default("rtsp-simple-server.yml").String()
-
-	kingpin.MustParse(k.Parse(args))
-
-	if *argVersion {
-		fmt.Println(version)
-		os.Exit(0)
+func (c *caster) onLog(msg string) {
+	label, _ := parseLog(msg)
+	if len(label) == 0 {
+		return
 	}
-
-	// on Linux, try to raise the number of file descriptors that can be opened
-	// to allow the maximum possible number of clients
-	// do not check for errors
-	rlimit.Raise()
-
-	ctx, ctxCancel := context.WithCancel(context.Background())
-
-	p := &program{
-		ctx:       ctx,
-		ctxCancel: ctxCancel,
-		confPath:  *argConfPath,
-		done:      make(chan struct{}),
+	switch label {
+	case SessionOpened:
+	case SessionPublishing:
+	case SessionClosed:
+	case ReceiverOpened:
+	case ReceiverReading:
+		system.Root.Send(c.self, STARTED)
+	case ReceiverClosed:
+	case ReceiverNoSender:
+		system.Root.Send(c.self, RECONNECTING)
 	}
+}
 
-	var err error
-	p.conf, p.confFound, err = conf.Load(p.confPath)
+func (c *caster) call(cmd int) error {
+	type command struct {
+		Command int    `json:"command"`
+		Data    string `json:"data"`
+	}
+	cmdStr, err := json.Marshal(&command{
+		Command: cmd,
+		Data:    "10.224.72.95",
+	})
 	if err != nil {
-		fmt.Printf("ERR: %s\n", err)
-		return nil, false
+		return err
 	}
 
-	err = p.createResources(true)
+	conn, err := net.Dial("tcp4", c.tvip+":10099")
 	if err != nil {
-		p.Log(logger.Info, "ERR: %s", err)
-		p.closeResources(nil)
-		return nil, false
+		return err
+	}
+	defer conn.Close()
+	conn.SetWriteDeadline(time.Now().Add(time.Second * 3))
+	toSend := string(cmdStr) + "\n"
+	n, err := conn.Write([]byte(toSend))
+	if err != nil {
+		return err
 	}
 
-	if p.confFound {
-		p.confWatcher, err = confwatcher.New(p.confPath)
-		if err != nil {
-			p.Log(logger.Info, "ERR: %s", err)
-			p.closeResources(nil)
-			return nil, false
-		}
-	}
-
-	go p.run()
-
-	return p, true
-}
-
-func (p *program) close() {
-	p.ctxCancel()
-	<-p.done
-}
-
-func (p *program) Log(level logger.Level, format string, args ...interface{}) {
-	countPublishers := atomic.LoadInt64(p.stats.CountPublishers)
-	countReaders := atomic.LoadInt64(p.stats.CountReaders)
-
-	p.logger.Log(level, "[%d/%d] "+format, append([]interface{}{
-		countPublishers, countReaders,
-	}, args...)...)
-}
-
-func (p *program) run() {
-	defer close(p.done)
-
-	confChanged := func() chan struct{} {
-		if p.confWatcher != nil {
-			return p.confWatcher.Watch()
-		}
-		return make(chan struct{})
-	}()
-
-outer:
-	for {
-		select {
-		case <-confChanged:
-			err := p.reloadConf()
-			if err != nil {
-				p.Log(logger.Info, "ERR: %s", err)
-				break outer
-			}
-
-		case <-p.ctx.Done():
-			break outer
-		}
-	}
-
-	p.ctxCancel()
-
-	p.closeResources(nil)
-
-	if p.confWatcher != nil {
-		p.confWatcher.Close()
-	}
-}
-
-func (p *program) createResources(initial bool) error {
-	var err error
-
-	if p.stats == nil {
-		p.stats = stats.New()
-	}
-
-	if p.logger == nil {
-		p.logger, err = logger.New(
-			p.conf.LogLevelParsed,
-			p.conf.LogDestinationsParsed,
-			p.conf.LogFile)
-		if err != nil {
-			return err
-		}
-	}
-
-	if initial {
-		p.Log(logger.Info, "rtsp-simple-server %s", version)
-		if !p.confFound {
-			p.Log(logger.Warn, "configuration file not found, using the default one")
-		}
-	}
-
-	if p.conf.Metrics {
-		if p.metrics == nil {
-			p.metrics, err = metrics.New(
-				p.conf.MetricsAddress,
-				p.stats,
-				p)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if p.conf.PPROF {
-		if p.pprof == nil {
-			p.pprof, err = pprof.New(
-				p.conf.PPROFAddress,
-				p)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if p.pathMan == nil {
-		p.pathMan = pathman.New(
-			p.ctx,
-			p.conf.RTSPAddress,
-			p.conf.ReadTimeout,
-			p.conf.WriteTimeout,
-			p.conf.ReadBufferCount,
-			p.conf.ReadBufferSize,
-			p.conf.AuthMethodsParsed,
-			p.conf.Paths,
-			p.stats,
-			p)
-	}
-
-	if !p.conf.RTSPDisable &&
-		(p.conf.EncryptionParsed == conf.EncryptionNo ||
-			p.conf.EncryptionParsed == conf.EncryptionOptional) {
-		if p.serverRTSPPlain == nil {
-			_, useUDP := p.conf.ProtocolsParsed[gortsplib.StreamProtocolUDP]
-			p.serverRTSPPlain, err = rtspserver.New(
-				p.ctx,
-				p.conf.RTSPAddress,
-				p.conf.ReadTimeout,
-				p.conf.WriteTimeout,
-				p.conf.ReadBufferCount,
-				p.conf.ReadBufferSize,
-				useUDP,
-				p.conf.RTPAddress,
-				p.conf.RTCPAddress,
-				false,
-				"",
-				"",
-				p.conf.RTSPAddress,
-				p.conf.ProtocolsParsed,
-				p.conf.RunOnConnect,
-				p.conf.RunOnConnectRestart,
-				p.stats,
-				p.pathMan,
-				p)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if !p.conf.RTSPDisable &&
-		(p.conf.EncryptionParsed == conf.EncryptionStrict ||
-			p.conf.EncryptionParsed == conf.EncryptionOptional) {
-		if p.serverRTSPTLS == nil {
-			p.serverRTSPTLS, err = rtspserver.New(
-				p.ctx,
-				p.conf.RTSPSAddress,
-				p.conf.ReadTimeout,
-				p.conf.WriteTimeout,
-				p.conf.ReadBufferCount,
-				p.conf.ReadBufferSize,
-				false,
-				"",
-				"",
-				true,
-				p.conf.ServerCert,
-				p.conf.ServerKey,
-				p.conf.RTSPAddress,
-				p.conf.ProtocolsParsed,
-				p.conf.RunOnConnect,
-				p.conf.RunOnConnectRestart,
-				p.stats,
-				p.pathMan,
-				p)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if !p.conf.RTMPDisable {
-		if p.serverRTMP == nil {
-			p.serverRTMP, err = rtmpserver.New(
-				p.ctx,
-				p.conf.RTMPAddress,
-				p.conf.ReadTimeout,
-				p.conf.WriteTimeout,
-				p.conf.ReadBufferCount,
-				p.conf.RTSPAddress,
-				p.conf.RunOnConnect,
-				p.conf.RunOnConnectRestart,
-				p.stats,
-				p.pathMan,
-				p)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if !p.conf.HLSDisable {
-		if p.serverHLS == nil {
-			p.serverHLS, err = hlsserver.New(
-				p.ctx,
-				p.conf.HLSAddress,
-				p.conf.HLSSegmentCount,
-				p.conf.HLSSegmentDuration,
-				p.conf.ReadBufferCount,
-				p.stats,
-				p.pathMan,
-				p)
-			if err != nil {
-				return err
-			}
-		}
+	if n != len(toSend) {
+		return fmt.Errorf("not write all")
 	}
 
 	return nil
 }
 
-func (p *program) closeResources(newConf *conf.Conf) {
-	closeStats := false
-	if newConf == nil {
-		closeStats = true
-	}
+func (c *caster) setState(s state) {
+	c.s = s
+	fmt.Println("-----------", c.s)
+}
 
-	closeLogger := false
-	if newConf == nil ||
-		!reflect.DeepEqual(newConf.LogDestinationsParsed, p.conf.LogDestinationsParsed) ||
-		newConf.LogFile != p.conf.LogFile {
-		closeLogger = true
-	}
+func (c *caster) Receive(context actor.Context) {
+	switch msg := context.Message().(type) {
+	case *actor.Started:
+		program, ok := newProgram([]string{}, c.onLog)
+		if !ok {
+			panicOnErr(fmt.Errorf("rtmp server not inited"))
+		}
+		c.self = context.Self()
+		c.rtmp = program
 
-	closeMetrics := false
-	if newConf == nil ||
-		newConf.Metrics != p.conf.Metrics ||
-		newConf.MetricsAddress != p.conf.MetricsAddress ||
-		closeStats {
-		closeMetrics = true
-	}
+		c.res = "1920x1080"
+		go func() {
+			defer func() {
+				context.PoisonFuture(context.Self()).Wait()
+			}()
+			br := bufio.NewReader(c.cli)
+			for {
+				data, _, err := br.ReadLine()
+				if err == io.EOF {
+					break
+				}
+				panicOnErr(err)
+				context.Send(context.Self(), string(data))
+			}
+		}()
+	case *actor.Stopping:
+		c.cli.Close()
+		c.rtmp.close()
+	case *actor.Stopped:
+		close(c.closeCh)
+		c.closeCh = nil
+	case *actor.Restarting:
+		context.Poison(context.Self())
+	case string:
+		args := strings.Fields(msg)
+		switch args[0] {
+		case "start":
+			if c.pusher != nil {
+				log.Println("not idle")
+				return
+			}
+			c.tvip = "10.224.215.34"
+			if len(args) > 1 {
+				c.tvip = args[1]
+			}
 
-	closePPROF := false
-	if newConf == nil ||
-		newConf.PPROF != p.conf.PPROF ||
-		newConf.PPROFAddress != p.conf.PPROFAddress ||
-		closeStats {
-		closePPROF = true
-	}
+			c.setState(STARTING)
 
-	closePathMan := false
-	if newConf == nil ||
-		newConf.RTSPAddress != p.conf.RTSPAddress ||
-		newConf.ReadTimeout != p.conf.ReadTimeout ||
-		newConf.WriteTimeout != p.conf.WriteTimeout ||
-		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
-		newConf.ReadBufferSize != p.conf.ReadBufferSize ||
-		!reflect.DeepEqual(newConf.AuthMethodsParsed, p.conf.AuthMethodsParsed) ||
-		closeStats {
-		closePathMan = true
-	} else if !reflect.DeepEqual(newConf.Paths, p.conf.Paths) {
-		p.pathMan.OnProgramConfReload(newConf.Paths)
-	}
+			c.pusher = spawnPusher(context, c.res)
+			time.Sleep(time.Millisecond * 500)
+			c.call(1)
+		case "stop":
+			if c.pusher == nil {
+				log.Println("not started")
+				return
+			}
+			c.setState(STOPPING)
+			context.PoisonFuture(c.pusher).Wait()
+			c.pusher = nil
+			c.call(4)
+			c.setState(IDLE)
+		case "pause":
+			c.setState(PAUSED)
+			c.call(2)
+		case "resume":
+			c.setState(STARTED)
+			c.call(3)
+		case "setres":
+			c.res = "1920x1080"
+			if len(args) > 1 {
+				c.res = args[1]
+			}
 
-	closeServerPlain := false
-	if newConf == nil ||
-		newConf.RTSPDisable != p.conf.RTSPDisable ||
-		newConf.EncryptionParsed != p.conf.EncryptionParsed ||
-		newConf.RTSPAddress != p.conf.RTSPAddress ||
-		newConf.ReadTimeout != p.conf.ReadTimeout ||
-		newConf.WriteTimeout != p.conf.WriteTimeout ||
-		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
-		!reflect.DeepEqual(newConf.ProtocolsParsed, p.conf.ProtocolsParsed) ||
-		newConf.RTPAddress != p.conf.RTPAddress ||
-		newConf.RTCPAddress != p.conf.RTCPAddress ||
-		newConf.RTSPAddress != p.conf.RTSPAddress ||
-		!reflect.DeepEqual(newConf.ProtocolsParsed, p.conf.ProtocolsParsed) ||
-		newConf.RunOnConnect != p.conf.RunOnConnect ||
-		newConf.RunOnConnectRestart != p.conf.RunOnConnectRestart ||
-		closeStats ||
-		closePathMan {
-		closeServerPlain = true
-	}
-
-	closeServerTLS := false
-	if newConf == nil ||
-		newConf.RTSPDisable != p.conf.RTSPDisable ||
-		newConf.EncryptionParsed != p.conf.EncryptionParsed ||
-		newConf.RTSPSAddress != p.conf.RTSPSAddress ||
-		newConf.ReadTimeout != p.conf.ReadTimeout ||
-		newConf.WriteTimeout != p.conf.WriteTimeout ||
-		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
-		newConf.ServerCert != p.conf.ServerCert ||
-		newConf.ServerKey != p.conf.ServerKey ||
-		newConf.RTSPAddress != p.conf.RTSPAddress ||
-		!reflect.DeepEqual(newConf.ProtocolsParsed, p.conf.ProtocolsParsed) ||
-		newConf.RunOnConnect != p.conf.RunOnConnect ||
-		newConf.RunOnConnectRestart != p.conf.RunOnConnectRestart ||
-		closeStats ||
-		closePathMan {
-		closeServerTLS = true
-	}
-
-	closeServerRTMP := false
-	if newConf == nil ||
-		newConf.RTMPDisable != p.conf.RTMPDisable ||
-		newConf.RTMPAddress != p.conf.RTMPAddress ||
-		newConf.ReadTimeout != p.conf.ReadTimeout ||
-		newConf.WriteTimeout != p.conf.WriteTimeout ||
-		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
-		newConf.RTSPAddress != p.conf.RTSPAddress ||
-		newConf.RunOnConnect != p.conf.RunOnConnect ||
-		newConf.RunOnConnectRestart != p.conf.RunOnConnectRestart ||
-		closeStats ||
-		closePathMan {
-		closeServerRTMP = true
-	}
-
-	closeServerHLS := false
-	if newConf == nil ||
-		newConf.HLSDisable != p.conf.HLSDisable ||
-		newConf.HLSAddress != p.conf.HLSAddress ||
-		newConf.HLSSegmentCount != p.conf.HLSSegmentCount ||
-		newConf.HLSSegmentDuration != p.conf.HLSSegmentDuration ||
-		newConf.ReadBufferCount != p.conf.ReadBufferCount ||
-		closeStats ||
-		closePathMan {
-		closeServerHLS = true
-	}
-
-	if closeServerTLS && p.serverRTSPTLS != nil {
-		p.serverRTSPTLS.Close()
-		p.serverRTSPTLS = nil
-	}
-
-	if closeServerPlain && p.serverRTSPPlain != nil {
-		p.serverRTSPPlain.Close()
-		p.serverRTSPPlain = nil
-	}
-
-	if closePathMan && p.pathMan != nil {
-		p.pathMan.Close()
-		p.pathMan = nil
-	}
-
-	if closeServerHLS && p.serverHLS != nil {
-		p.serverHLS.Close()
-		p.serverHLS = nil
-	}
-
-	if closeServerRTMP && p.serverRTMP != nil {
-		p.serverRTMP.Close()
-		p.serverRTMP = nil
-	}
-
-	if closePPROF && p.pprof != nil {
-		p.pprof.Close()
-		p.pprof = nil
-	}
-
-	if closeMetrics && p.metrics != nil {
-		p.metrics.Close()
-		p.metrics = nil
-	}
-
-	if closeLogger && p.logger != nil {
-		p.logger.Close()
-		p.logger = nil
-	}
-
-	if closeStats && p.stats != nil {
-		p.stats.Close()
+			if c.pusher != nil {
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = spawnPusher(context, c.res)
+				time.Sleep(time.Millisecond * 500)
+				c.call(5)
+			}
+		}
+	case pusherMsg:
+		// log.Println("======", msg)
+		c.onLog(string(msg))
+	case *actor.Terminated:
+		if msg.Who.Equal(c.pusher) {
+			c.pusher = nil
+			c.setState(IDLE)
+		}
+	case state:
+		c.setState(msg)
 	}
 }
 
-func (p *program) reloadConf() error {
-	p.Log(logger.Info, "reloading configuration")
-
-	newConf, _, err := conf.Load(p.confPath)
-	if err != nil {
-		return err
+func panicOnErr(e error) {
+	if e != nil {
+		panic(e)
 	}
-
-	p.closeResources(newConf)
-
-	p.conf = newConf
-	return p.createResources(false)
 }
+
+var system = actor.NewActorSystem()
 
 func main() {
-	p, ok := newProgram(os.Args[1:])
-	if !ok {
-		os.Exit(1)
+	cli, err := net.Dial("tcp4", "127.0.0.1:9999")
+	panicOnErr(err)
+
+	writeLine := func(msg string) {
+		cli.Write([]byte(msg + "\n"))
 	}
-	<-p.done
+
+	writeLine("casterkey")
+	writeLine("ver:111")
+
+	closeCh := make(chan struct{})
+
+	props := actor.PropsFromProducer(func() actor.Actor { return &caster{cli: cli, closeCh: closeCh} }) //.WithReceiverMiddleware(middleware.Logger)
+	_, err = system.Root.SpawnNamed(props, "caster")
+	panicOnErr(err)
+
+	<-closeCh
 }
