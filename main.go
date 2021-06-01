@@ -61,7 +61,7 @@ func (c *caster) call(cmd int) error {
 	}
 	cmdStr, err := json.Marshal(&command{
 		Command: cmd,
-		Data:    "10.224.72.95",
+		Data:    "10.224.193.13",
 	})
 	if err != nil {
 		return err
@@ -140,7 +140,7 @@ func (c *caster) Receive(context actor.Context) {
 			c.setState(STARTING)
 
 			c.pusher = spawnPusher(context, c.res)
-			time.Sleep(time.Millisecond * 500)
+			time.Sleep(time.Millisecond * 1000)
 			c.call(1)
 		case "stop":
 			if c.pusher == nil {
@@ -193,6 +193,7 @@ func panicOnErr(e error) {
 var system = actor.NewActorSystem()
 
 func main() {
+
 	cli, err := net.Dial("tcp4", "127.0.0.1:9999")
 	panicOnErr(err)
 

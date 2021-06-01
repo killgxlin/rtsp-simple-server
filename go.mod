@@ -3,7 +3,7 @@ module github.com/aler9/rtsp-simple-server
 go 1.15
 
 require (
-	github.com/AsynkronIT/protoactor-go v0.0.0-20210520041424-43065ace108f // indirect
+	github.com/AsynkronIT/protoactor-go v0.0.0-20210520041424-43065ace108f
 	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751 // indirect
 	github.com/alecthomas/units v0.0.0-20190924025748-f65c72e2690d // indirect
 	github.com/aler9/gortsplib v0.0.0-20210530105246-d07e93f2453e

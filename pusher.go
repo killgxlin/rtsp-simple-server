@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -16,15 +17,37 @@ import (
 	"github.com/AsynkronIT/protoactor-go/actor"
 )
 
+func getBinPath(name string) (string, error) {
+	postFix := ""
+	if runtime.GOOS == `windows` {
+		postFix = ".exe"
+	}
+	return filepath.Abs(path.Join(path.Dir(os.Args[0]), "bin", name+postFix))
+}
+
+func getScreenDeviceIndex() (string, error) {
+
+	binPath, err := getBinPath("ffmpeg")
+	panicOnErr(err)
+
+	args := `-f avfoundation -list_devices true -i ""`
+	cmd := exec.Command(binPath, strings.Fields(args)...)
+	data, err := cmd.Output()
+
+	if ee, ok := err.(*exec.ExitError); ok {
+		output := string(ee.Stderr)
+		res := regexp.MustCompile(`\[(\d)+\] Capture screen`).FindStringSubmatch(output)
+		if len(res) > 0 {
+			return res[1], nil
+		}
+	}
+
+	fmt.Println(string(data))
+	return "", fmt.Errorf("error get capture device index")
+}
+
 func getFfmpegArg(res string) string {
 	wh := strings.Split(res, "x")
-
-	macArgs := `-fflags nobuffer -avioflags direct
--f avfoundation -r 30 -capture_cursor 1 -capture_mouse_clicks 1
--i ${darwinDeviceIndex}
--c:v h264_videotoolbox -preset ultrafast -tune zerolatency -profile:v baseline  -allow_sw 1
--f rtsp -b:v 10000000
-rtsp://localhost:8554/broadcaster/watcher/upstream`
 
 	winArgs := fmt.Sprintf(`-fflags nobuffer -avioflags direct
 -f gdigrab -framerate 30 -show_region 1 -draw_mouse 1
@@ -36,6 +59,16 @@ rtsp://localhost:8554/broadcaster/watcher/upstream`, wh[0])
 	if runtime.GOOS == `windows` {
 		return winArgs
 	}
+
+	index, err := getScreenDeviceIndex()
+	panicOnErr(err)
+
+	macArgs := fmt.Sprintf(`-fflags nobuffer -avioflags direct
+-f avfoundation -r 30 -capture_cursor 1 -capture_mouse_clicks 1
+-i %s
+-c:v h264_videotoolbox -preset ultrafast -tune zerolatency -profile:v baseline  -allow_sw 1
+-f rtsp -b:v 10000000
+rtsp://localhost:8554/broadcaster/watcher/upstream`, index)
 
 	return macArgs
 }
@@ -51,7 +84,7 @@ type pusher struct {
 func (p *pusher) Receive(context actor.Context) {
 	switch msg := context.Message().(type) {
 	case *actor.Started:
-		execPath, err := filepath.Abs(path.Join(path.Dir(os.Args[0]), "bin", "ffmpeg.exe"))
+		execPath, err := getBinPath("ffmpeg")
 		panicOnErr(err)
 
 		args := strings.Fields(getFfmpegArg(p.res))
@@ -72,7 +105,7 @@ func (p *pusher) Receive(context actor.Context) {
 			br := bufio.NewReader(r)
 			for {
 				data, _, err := br.ReadLine()
-				if err == io.EOF {
+				if err != nil {
 					break
 				}
 				panicOnErr(err)
