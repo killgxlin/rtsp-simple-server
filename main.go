@@ -61,7 +61,7 @@ func (c *caster) call(cmd int) error {
 	}
 	cmdStr, err := json.Marshal(&command{
 		Command: cmd,
-		Data:    "10.224.193.13",
+		Data:    getLocalIp()[0],
 	})
 	if err != nil {
 		return err
@@ -193,7 +193,6 @@ func panicOnErr(e error) {
 var system = actor.NewActorSystem()
 
 func main() {
-
 	cli, err := net.Dial("tcp4", "127.0.0.1:9999")
 	panicOnErr(err)
 

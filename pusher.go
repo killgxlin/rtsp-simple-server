@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -16,6 +17,31 @@ import (
 
 	"github.com/AsynkronIT/protoactor-go/actor"
 )
+
+func getLocalIp() []string {
+	ips := []string{}
+	ifaces, err := net.Interfaces()
+	panicOnErr(err)
+	for _, i := range ifaces {
+		addrs, err := i.Addrs()
+		panicOnErr(err)
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if !ip.IsGlobalUnicast() {
+				continue
+			}
+			// fmt.Println("IPNnet", ip)
+			ips = append(ips, ip.String())
+		}
+	}
+	return ips
+}
 
 func getBinPath(name string) (string, error) {
 	postFix := ""
