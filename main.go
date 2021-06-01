@@ -3,10 +3,10 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
-	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,10 +30,13 @@ type caster struct {
 	closeCh chan struct{}
 	rtmp    *program
 
-	tvip string
-	res  string
 	self *actor.PID
 	s    state
+
+	localIp     string
+	tvip        string
+	res         string
+	connTimeout int
 }
 
 func (c *caster) onLog(msg string) {
@@ -61,7 +64,7 @@ func (c *caster) call(cmd int) error {
 	}
 	cmdStr, err := json.Marshal(&command{
 		Command: cmd,
-		Data:    getLocalIp()[0],
+		Data:    c.localIp,
 	})
 	if err != nil {
 		return err
@@ -88,7 +91,17 @@ func (c *caster) call(cmd int) error {
 
 func (c *caster) setState(s state) {
 	c.s = s
-	fmt.Println("-----------", c.s)
+	c.writeToCli(fmt.Sprintf("state:%s", c.s))
+}
+
+func (c *caster) writeToCli(msg string) {
+	if c.cli != nil {
+		c.cli.Write([]byte(msg + "\n"))
+	}
+}
+
+func (c *caster) needGainPrivacy() bool {
+	return false
 }
 
 func (c *caster) Receive(context actor.Context) {
@@ -109,7 +122,7 @@ func (c *caster) Receive(context actor.Context) {
 			br := bufio.NewReader(c.cli)
 			for {
 				data, _, err := br.ReadLine()
-				if err == io.EOF {
+				if err != nil {
 					break
 				}
 				panicOnErr(err)
@@ -127,37 +140,90 @@ func (c *caster) Receive(context actor.Context) {
 	case string:
 		args := strings.Fields(msg)
 		switch args[0] {
+		case "ver":
+			c.writeToCli("ver:111")
 		case "start":
+			// start 192001080 10.224.72.95 xxxx 10.224.215.34 xxxx 20 10
+			// start res localip dummy tvip dummy dummy connectTimeout
+			// 0	 1	 2		 3	   4	5	  6		7
 			if c.pusher != nil {
-				log.Println("not idle")
-				return
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = nil
 			}
-			c.tvip = "10.224.215.34"
+
+			// old format XXXX0YYYY to XXXXxYYYY
 			if len(args) > 1 {
-				c.tvip = args[1]
+				c.res = args[1]
+				aa := []rune(c.res)
+				aa[4] = rune('x')
+				c.res = string(aa)
+			}
+
+			if len(args) > 2 {
+				c.localIp = args[2]
+			}
+
+			c.tvip = "10.224.215.34"
+			if len(args) > 4 {
+				c.tvip = args[4]
+			}
+
+			if len(args) > 7 {
+				connTimeout, err := strconv.ParseInt(args[7], 10, 32)
+				panicOnErr(err)
+				c.connTimeout = int(connTimeout)
 			}
 
 			c.setState(STARTING)
-
+			c.writeToCli("log:begin cast_start")
 			c.pusher = spawnPusher(context, c.res)
 			time.Sleep(time.Millisecond * 1000)
-			c.call(1)
-		case "stop":
-			if c.pusher == nil {
-				log.Println("not started")
+			c.writeToCli("log:end cast_start")
+
+			if c.needGainPrivacy() {
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = nil
+				c.writeToCli("event:gain_privacy")
+				c.cli.Close()
 				return
 			}
-			c.setState(STOPPING)
-			context.PoisonFuture(c.pusher).Wait()
-			c.pusher = nil
+
+			if c.call(1) != nil {
+				c.writeToCli("event:tv_communicate_error")
+				c.writeToCli("state:IDLE")
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = nil
+			}
+
+			c.writeToCli("cmdEcho:start")
+		case "stop":
 			c.call(4)
+
+			c.setState(STOPPING)
+			if c.pusher != nil {
+				c.writeToCli("log:begin cast_stop")
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = nil
+				c.writeToCli("log:end cast_stop")
+			}
+
 			c.setState(IDLE)
+			if len(args) > 1 {
+				c.writeToCli("event:" + args[1])
+			}
+			c.writeToCli("cmdEcho:stop")
 		case "pause":
 			c.setState(PAUSED)
 			c.call(2)
+
+			c.writeToCli("state:PAUSED")
+			c.writeToCli("cmdEcho:pause")
 		case "resume":
 			c.setState(STARTED)
 			c.call(3)
+
+			c.writeToCli("state:STARTED")
+			c.writeToCli("cmdEcho:resume")
 		case "setres":
 			c.res = "1920x1080"
 			if len(args) > 1 {
@@ -170,6 +236,14 @@ func (c *caster) Receive(context actor.Context) {
 				time.Sleep(time.Millisecond * 500)
 				c.call(5)
 			}
+			c.writeToCli("cmdEcho:setres")
+		case "exit":
+			if c.pusher != nil {
+				context.PoisonFuture(c.pusher).Wait()
+				c.pusher = nil
+			}
+			c.writeToCli("cmdEcho:exit")
+			c.cli.Close()
 		}
 	case pusherMsg:
 		// log.Println("======", msg)
@@ -192,8 +266,11 @@ func panicOnErr(e error) {
 
 var system = actor.NewActorSystem()
 
+var port = flag.Int("p", -1, "help message for flag n")
+
 func main() {
-	cli, err := net.Dial("tcp4", "127.0.0.1:9999")
+	flag.Parse()
+	cli, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", *port))
 	panicOnErr(err)
 
 	writeLine := func(msg string) {

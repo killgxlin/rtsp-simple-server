@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -18,13 +17,23 @@ import (
 	"github.com/AsynkronIT/protoactor-go/actor"
 )
 
-func getLocalIp() []string {
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func getLocalIp(ipPrefix string) []string {
 	ips := []string{}
 	ifaces, err := net.Interfaces()
 	panicOnErr(err)
 	for _, i := range ifaces {
 		addrs, err := i.Addrs()
 		panicOnErr(err)
+
+		// fmt.Println("IPNnet", i.Name)
 		for _, addr := range addrs {
 			var ip net.IP
 			switch v := addr.(type) {
@@ -33,11 +42,16 @@ func getLocalIp() []string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
+
 			if !ip.IsGlobalUnicast() {
 				continue
 			}
+			ipStr := ip.String()
+			if len(ipPrefix) > 0 && strings.Index(ipStr, ipPrefix) < 0 {
+				continue
+			}
 			// fmt.Println("IPNnet", ip)
-			ips = append(ips, ip.String())
+			ips = append(ips, ipStr)
 		}
 	}
 	return ips
@@ -48,7 +62,13 @@ func getBinPath(name string) (string, error) {
 	if runtime.GOOS == `windows` {
 		postFix = ".exe"
 	}
-	return filepath.Abs(path.Join(path.Dir(os.Args[0]), "bin", name+postFix))
+	binpath, err := filepath.Abs(filepath.Join(filepath.Dir(os.Args[0]), name+postFix))
+	panicOnErr(err)
+	if fileExists(binpath) {
+		return binpath, err
+	}
+
+	return filepath.Abs(filepath.Join(filepath.Dir(os.Args[0]), "bin", name+postFix))
 }
 
 func getScreenDeviceIndex() (string, error) {
