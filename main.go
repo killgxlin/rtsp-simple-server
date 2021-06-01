@@ -40,6 +40,7 @@ type caster struct {
 }
 
 func (c *caster) onLog(msg string) {
+	fmt.Println(msg)
 	label, _ := parseLog(msg)
 	if len(label) == 0 {
 		return
@@ -70,7 +71,7 @@ func (c *caster) call(cmd int) error {
 		return err
 	}
 
-	conn, err := net.Dial("tcp4", c.tvip+":10099")
+	conn, err := net.DialTimeout("tcp4", c.tvip+":10099", time.Second*time.Duration(c.connTimeout))
 	if err != nil {
 		return err
 	}
@@ -101,7 +102,8 @@ func (c *caster) writeToCli(msg string) {
 }
 
 func (c *caster) needGainPrivacy() bool {
-	return false
+	return needGainPrivacy()
+
 }
 
 func (c *caster) Receive(context actor.Context) {
@@ -143,9 +145,9 @@ func (c *caster) Receive(context actor.Context) {
 		case "ver":
 			c.writeToCli("ver:111")
 		case "start":
-			// start 192001080 10.224.72.95 xxxx 10.224.215.34 xxxx 20 10
-			// start res localip dummy tvip dummy dummy connectTimeout
-			// 0	 1	 2		 3	   4	5	  6		7
+			// start	192001080	10.224.72.95	xxxx	10.224.215.34	xxxx	20		10
+			// start 	res			localip 		dummy	tvip			dummy 	dummy	connectTimeout
+			// 0	 	1	 	    2		 		3	   	4				5	  	6		7
 			if c.pusher != nil {
 				context.PoisonFuture(c.pusher).Wait()
 				c.pusher = nil
@@ -168,6 +170,7 @@ func (c *caster) Receive(context actor.Context) {
 				c.tvip = args[4]
 			}
 
+			c.connTimeout = 5
 			if len(args) > 7 {
 				connTimeout, err := strconv.ParseInt(args[7], 10, 32)
 				panicOnErr(err)
@@ -269,6 +272,7 @@ var system = actor.NewActorSystem()
 var port = flag.Int("p", -1, "help message for flag n")
 
 func main() {
+
 	flag.Parse()
 	cli, err := net.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", *port))
 	panicOnErr(err)

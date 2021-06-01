@@ -130,6 +130,7 @@ type pusher struct {
 func (p *pusher) Receive(context actor.Context) {
 	switch msg := context.Message().(type) {
 	case *actor.Started:
+		preparePrivacy()
 		execPath, err := getBinPath("ffmpeg")
 		panicOnErr(err)
 
