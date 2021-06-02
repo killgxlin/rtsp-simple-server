@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -17,58 +14,23 @@ import (
 	"github.com/AsynkronIT/protoactor-go/actor"
 )
 
-func fileExists(filename string) bool {
-	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		return false
-	}
-	return !info.IsDir()
-}
-
-func getLocalIp(ipPrefix string) []string {
-	ips := []string{}
-	ifaces, err := net.Interfaces()
+func getFfmpegVer() (string, error) {
+	binPath, err := getBinPath("ffmpeg")
 	panicOnErr(err)
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
-		panicOnErr(err)
 
-		// fmt.Println("IPNnet", i.Name)
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			if !ip.IsGlobalUnicast() {
-				continue
-			}
-			ipStr := ip.String()
-			if len(ipPrefix) > 0 && strings.Index(ipStr, ipPrefix) < 0 {
-				continue
-			}
-			// fmt.Println("IPNnet", ip)
-			ips = append(ips, ipStr)
-		}
-	}
-	return ips
-}
-
-func getBinPath(name string) (string, error) {
-	postFix := ""
-	if runtime.GOOS == `windows` {
-		postFix = ".exe"
-	}
-	binpath, err := filepath.Abs(filepath.Join(filepath.Dir(os.Args[0]), name+postFix))
+	args := `-version`
+	cmd := exec.Command(binPath, strings.Fields(args)...)
+	data, err := cmd.Output()
 	panicOnErr(err)
-	if fileExists(binpath) {
-		return binpath, err
+
+	res := regexp.MustCompile(`ffmpeg version ([a-zA-Z0-9\-]+) `).FindStringSubmatch(string(data))
+	fmt.Println(res)
+	if len(res) > 0 {
+		return res[1], nil
 	}
 
-	return filepath.Abs(filepath.Join(filepath.Dir(os.Args[0]), "bin", name+postFix))
+	fmt.Println(string(data))
+	return "unknown", fmt.Errorf("error get capture device index")
 }
 
 func getScreenDeviceIndex() (string, error) {
