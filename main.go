@@ -140,6 +140,7 @@ func (c *caster) Receive(context actor.Context) {
 	case *actor.Restarting:
 		context.Poison(context.Self())
 	case string:
+		c.onLog(fmt.Sprinf("recv cmd: %s", msg))
 		args := strings.Fields(msg)
 		switch args[0] {
 		case "ver":
