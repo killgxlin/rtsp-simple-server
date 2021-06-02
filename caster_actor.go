@@ -57,6 +57,36 @@ func (c *caster) onLog(msg string) {
 	}
 }
 
+var (
+	errInitRtmp = fmt.Errorf("err init rtmp server")
+)
+
+func (c *caster) doOp(context actor.Context, op int) error {
+	switch op {
+	case 1:
+		program, ok := newProgram([]string{}, c.onLog)
+		if !ok {
+			return errInitRtmp
+		}
+		c.rtmp = program
+		c.pusher = spawnPusher(context, c.res)
+		return nil
+	case 0:
+		if c.pusher != nil {
+			context.PoisonFuture(c.pusher).Wait()
+			c.pusher = nil
+		}
+
+		if c.rtmp != nil {
+			c.rtmp.close()
+			c.rtmp = nil
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid op:%d", op)
+	}
+}
+
 func (c *caster) call(cmd int) error {
 	type command struct {
 		Command int    `json:"command"`
@@ -108,12 +138,7 @@ func (c *caster) needGainPrivacy() bool {
 func (c *caster) Receive(context actor.Context) {
 	switch msg := context.Message().(type) {
 	case *actor.Started:
-		program, ok := newProgram([]string{}, c.onLog)
-		if !ok {
-			panicOnErr(fmt.Errorf("rtmp server not inited"))
-		}
 		c.self = context.Self()
-		c.rtmp = program
 
 		c.res = "1920x1080"
 		go func() {
@@ -130,14 +155,11 @@ func (c *caster) Receive(context actor.Context) {
 			}
 		}()
 	case *actor.Stopping:
+		c.doOp(context, 0)
+
 		if c.cli != nil {
 			c.cli.Close()
 			c.cli = nil
-		}
-
-		if c.rtmp != nil {
-			c.rtmp.close()
-			c.rtmp = nil
 		}
 	case *actor.Stopped:
 		close(c.closeCh)
@@ -150,6 +172,8 @@ func (c *caster) Receive(context actor.Context) {
 		if len(args) == 0 {
 			return
 		}
+
+		c.writeToCli("cmdEcho:" + args[0])
 		switch args[0] {
 		case "ver":
 			c.writeToCli("ver:" + ffmpegVer)
@@ -157,9 +181,8 @@ func (c *caster) Receive(context actor.Context) {
 			// start	192001080	10.224.72.95	xxxx	10.224.215.34	xxxx	20		10
 			// start 	res			localip 		dummy	tvip			dummy 	dummy	connectTimeout
 			// 0	 	1	 	    2		 		3	   	4				5	  	6		7
-			if c.pusher != nil {
-				context.PoisonFuture(c.pusher).Wait()
-				c.pusher = nil
+			if c.pusher != nil || c.rtmp != nil {
+				c.doOp(context, 0)
 			}
 
 			// old format XXXX0YYYY to XXXXxYYYY
@@ -187,55 +210,52 @@ func (c *caster) Receive(context actor.Context) {
 			}
 
 			c.setState(STARTING)
-			c.writeToCli("log:begin cast_start")
-			c.pusher = spawnPusher(context, c.res)
-			time.Sleep(time.Millisecond * 1000)
-			c.writeToCli("log:end cast_start")
 
-			if c.needGainPrivacy() {
-				context.PoisonFuture(c.pusher).Wait()
-				c.pusher = nil
-				c.writeToCli("event:gain_privacy")
-				c.cli.Close()
+			c.writeToCli("log:begin cast_start")
+			err := c.doOp(context, 1)
+			if err == errInitRtmp {
+				c.writeToCli("event:rtmp_init_error")
+				c.setState(IDLE)
 				return
 			}
 
+			c.writeToCli("log:end cast_start")
+
+			if c.needGainPrivacy() {
+				c.doOp(context, 0)
+				c.writeToCli("event:gain_privacy")
+				c.cli.Close()
+				c.cli = nil
+				return
+			}
+
+			// wait local stream init
+			time.Sleep(time.Millisecond * 1000)
+
 			if c.call(1) != nil {
 				c.writeToCli("event:tv_communicate_error")
-				c.writeToCli("state:IDLE")
-				context.PoisonFuture(c.pusher).Wait()
-				c.pusher = nil
-			}
+				c.setState(IDLE)
 
-			c.writeToCli("cmdEcho:start")
+				c.doOp(context, 0)
+			}
 		case "stop":
+			c.setState(STOPPING)
 			c.call(4)
 
-			c.setState(STOPPING)
-			if c.pusher != nil {
-				c.writeToCli("log:begin cast_stop")
-				context.PoisonFuture(c.pusher).Wait()
-				c.pusher = nil
-				c.writeToCli("log:end cast_stop")
-			}
+			c.writeToCli("log:begin cast_stop")
+			c.doOp(context, 0)
+			c.writeToCli("log:end cast_stop")
 
 			c.setState(IDLE)
 			if len(args) > 1 {
 				c.writeToCli("event:" + args[1])
 			}
-			c.writeToCli("cmdEcho:stop")
 		case "pause":
 			c.setState(PAUSED)
 			c.call(2)
-
-			c.writeToCli("state:PAUSED")
-			c.writeToCli("cmdEcho:pause")
 		case "resume":
 			c.setState(STARTED)
 			c.call(3)
-
-			c.writeToCli("state:STARTED")
-			c.writeToCli("cmdEcho:resume")
 		case "setres":
 			c.res = "1920x1080"
 			if len(args) > 1 {
@@ -248,14 +268,9 @@ func (c *caster) Receive(context actor.Context) {
 				time.Sleep(time.Millisecond * 500)
 				c.call(5)
 			}
-			c.writeToCli("cmdEcho:setres")
 		case "exit":
-			if c.pusher != nil {
-				context.PoisonFuture(c.pusher).Wait()
-				c.pusher = nil
-			}
-			c.writeToCli("cmdEcho:exit")
 			c.cli.Close()
+			c.cli = nil
 		}
 	case pusherMsg:
 		c.onLog("pusher: " + string(msg))
